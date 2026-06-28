@@ -1,0 +1,21 @@
+{
+  "name": "mc-proxy",
+  "version": "1.0.0",
+  "description": "Two-agent Minecraft proxy: Host connects to the real server, Slave accepts players",
+  "bin": {
+    "mc-proxy-host": "./mc-proxy-host.js",
+    "mc-proxy-slave": "./mc-proxy-slave.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EliasL-git/mc-proxy"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "mc-proxy-host.js",
+    "mc-proxy-slave.js"
+  ]
+}
