@@ -1,16 +1,25 @@
 # mcnux — Minecraft Proxy CLI
 
-Zero-dependency Minecraft server proxy with connection approval.
+Zero-dependency Minecraft server proxy with connection approval. Works with the [mcnux-plugin](https://github.com/EliasL-git/mcnux-plugin) Paper plugin.
 
 ## Architecture
 
 ```
-Player → Slave :25565 (pending queue) → Host approves → tunnel → MC Server
+Player (vanilla MC client)
+    │
+    │  connects to play.myserver.com → points to VPS
+    ▼
+VPS — mcnux serve (public, lightweight)
+    │  ← TCP control connection (auto-connects to home server)
+    ▼
+Home Server — Paper + mcnux-plugin (private, hidden)
+    │  /mcnux approve <id>  or  /mcnux deny <id>
+    ▼
+Player joins or gets kicked back
 ```
 
-Two components working together:
-- **Slave** — runs on a public-facing machine, accepts player connections (but queues them for approval)
-- **Host** — runs on the MC server machine, connects to Slave, shows pending connections and lets you approve/deny them
+- **`mcnux serve`** — runs on your VPS, accepts player connections, forwards approval requests to the plugin
+- **mcnux-plugin** — runs on your Paper server, acts as the Host (validates VPS IP, receives requests, sends approve/deny)
 
 ## Install
 
@@ -18,85 +27,64 @@ Two components working together:
 npm install -g mcnux
 ```
 
-Or run directly:
-
-```bash
-node mcnux.js serve
-node mcnux.js host 192.168.1.100 25567
-```
-
 ## Usage
 
-### 1. Start the Slave (public machine)
+### On your home server (MC server):
+
+Drop `mcnux-plugin-1.0.0.jar` into `plugins/`, start once, then set your VPS IP in `plugins/mcnux-plugin/config.yml`.
+
+The plugin listens on `MC port + 2` (e.g. 25565 → 25567).
+
+### On your VPS:
 
 ```bash
-mcnux serve [player-port] [control-port]
+mcnux serve [player-port] <home-server-ip> [plugin-control-port]
 ```
 
-Default player port: `25565` — players connect here
-Default control port: `25567` — Host connects here
-
-Players who connect are **queued pending approval**. They wait until the Host approves them.
-
-### 2. Start the Host (MC server machine)
-
+Example:
 ```bash
-mcnux host <slave-host> <control-port> [--mc-server <addr>]
+mcnux serve 25565 123.45.67.89 25567
 ```
 
-Connects to the Slave's control port and gives you an interactive prompt:
+| Arg | Default | Description |
+|-----|---------|-------------|
+| `player-port` | `25565` | Port players connect to |
+| `home-server-ip` | *required* | Your home server's IP |
+| `plugin-control-port` | `25567` | Plugin's control port |
 
-```
-mcnux host>
-```
-
-#### Host Commands
-
-| Command | Description |
-|---------|-------------|
-| `connections` | List pending players |
-| `approve <id>` | Let a player through |
-| `deny <id>` | Reject a player |
-| `active` | Show active tunnels |
-| `refresh` | Re-fetch pending list |
-| `help` | Show available commands |
-| `exit` | Disconnect and quit |
-
-### Example
-
-```bash
-# On your public VPS (Slave):
-mcnux serve
-
-# On your Minecraft server machine (Host):
-mcnux host 203.0.113.5 25567
-
-# When a player connects, you'll see:
-# ➜ [1] New connection from 203.0.113.50:54321 — type "approve 1" to allow
-mcnux host> approve 1
-# ✓ Approved connection 1
-# Data flows through the tunnel
-```
+What happens:
+1. Proxy connects to plugin's control port → plugin validates your VPS IP
+2. Player connects to VPS on player port → proxy sends request to plugin
+3. Plugin notifies in-game ops → they `/mcnux approve <id>` or `/mcnux deny <id>`
+4. Proxy tunnels traffic to your home MC server
 
 ## Options
 
 | Flag | Description |
 |------|-------------|
-| `--mc-server <addr>` | Target Minecraft server (default: `localhost:25565`) |
 | `--no-color` | Disable ANSI colored output |
 | `-h, --help` | Show help |
 | `--version` | Print version |
 
-## How it works
+## Protocol
 
-1. Players connect to the **Slave** on the public port
-2. The Slave buffers their connection and notifies the **Host** via the control channel
-3. The Host admin runs the interactive CLI — they see pending connections and **approve or deny** them
-4. On approval, the Slave opens a direct TCP tunnel to the Host, which connects to the Minecraft server
-5. All traffic flows: **Player ↔ Slave ↔ Host ↔ MC Server**
-6. The Host controls exactly who gets through — no unwanted connections
+JSON lines over TCP between proxy and plugin:
+
+**Proxy → Plugin:**
+```json
+{"type":"connect","connId":"1","playerName":"Notch","playerUuid":"...","playerIp":"1.2.3.4","playerPort":54321,"proxyHost":"1.2.3.4:54321"}
+{"type":"disconnect","connId":"1"}
+```
+
+**Plugin → Proxy:**
+```json
+{"type":"hello","port":25565}
+{"type":"approve","connId":"1"}
+{"type":"deny","connId":"1"}
+```
 
 ## Requirements
 
 - Node.js >= 18
-- Zero npm dependencies — uses only built-in `net` and `readline` modules
+- Zero npm dependencies — uses only built-in `net` module
+- [mcnux-plugin](https://github.com/EliasL-git/mcnux-plugin) on the MC server
