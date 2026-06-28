@@ -115,6 +115,33 @@ function readString(buf, offset) {
   return { value: buf.toString('utf8', start, end), bytesRead: len.bytesRead + len.value };
 }
 
+/**
+ * Attempt to extract player name from buffered MC packets.
+ * Looks for login start packet (0x00 in login state) which has a string field.
+ * Best-effort — returns null if not found yet.
+ */
+function extractPlayerName(buf) {
+  let offset = 0;
+  while (offset < buf.length) {
+    const packetLen = readVarInt(buf, offset);
+    if (!packetLen) break;
+    offset += packetLen.bytesRead;
+    if (offset >= buf.length) break;
+    const packetId = readVarInt(buf, offset);
+    if (!packetId) break;
+    if (packetId.value === 0x00 && offset + 3 < buf.length) {
+      // Could be login start — try reading a string
+      const name = readString(buf, offset + packetId.bytesRead);
+      if (name && name.value && name.value.length > 0 && name.value.length <= 16) {
+        return name.value;
+      }
+    }
+    // Skip this packet
+    offset += packetLen.value - packetLen.bytesRead + packetId.bytesRead;
+  }
+  return null;
+}
+
 function parseHandshake(buf) {
   let offset = 0;
   const packetLen = readVarInt(buf, offset);
@@ -185,15 +212,15 @@ function bridgeSockets(sockA, sockB, onStats) {
 
 // ───────────────────────────────────────────────────────────────
 //  SERVE — Slave mode
-//  Listens for Minecraft players AND control connections from Host
+//  Listens for Minecraft players, connects to plugin control server
+//  Protocol: JSON lines over TCP
 // ───────────────────────────────────────────────────────────────
 
-function runServe(playerPort, controlPort, opts) {
+function runServe(playerPort, pluginHost, pluginPort, opts) {
   const verbose = opts.verbose;
-  const mcTarget = opts.mcTarget ? parseAddr(opts.mcTarget) : null;
 
   // ── Slave State ──────────────────────────────────────────
-  let hostControlSock = null;          // connected Host's control socket
+  let hostControlSock = null;          // socket to plugin control server
   const pendingConns = new Map();      // id -> { id, playerSock, playerAddr, bytes, handshake }
   const activeConns = new Map();       // id -> { id, playerSock, tunnelSock, bridge, bytes, handshake }
   let connIdCounter = 0;
@@ -208,22 +235,19 @@ function runServe(playerPort, controlPort, opts) {
     try { hostControlSock.write(msg + '\n'); } catch (_) {}
   }
 
-  // ── Control Server (for Host connections) ────────────────
-  const controlServer = net.createServer((ctrlSock) => {
-    if (hostControlSock && !hostControlSock.destroyed) {
-      log('warn', 'Host already connected — rejecting duplicate');
-      ctrlSock.end('BUSY Another host is already connected\n');
-      return;
-    }
+  // ── Connect to Plugin Control Server ─────────────────────
+  function connectToPlugin() {
+    log('info', `Connecting to plugin at ${c(C.cyan, `${pluginHost}:${pluginPort}`)}...`);
 
-    const hostAddr = `${ctrlSock.remoteAddress}:${ctrlSock.remotePort}`;
-    log('ok', `Host connected from ${c(C.cyan, hostAddr)}`);
-    hostControlSock = ctrlSock;
-
-    // Buffer for partial line reads
+    const sock = new net.Socket();
     let buf = '';
 
-    ctrlSock.on('data', (chunk) => {
+    sock.connect(pluginPort, pluginHost, () => {
+      log('ok', `Connected to plugin control server at ${c(C.cyan, `${pluginHost}:${pluginPort}`)}`);
+      hostControlSock = sock;
+    });
+
+    sock.on('data', (chunk) => {
       buf += chunk.toString();
       while (buf.includes('\n')) {
         const nlIdx = buf.indexOf('\n');
@@ -234,92 +258,105 @@ function runServe(playerPort, controlPort, opts) {
       }
     });
 
-    ctrlSock.once('close', () => {
-      log('warn', `Host disconnected ${c(C.dim, hostAddr)}`);
+    sock.once('close', () => {
+      log('warn', 'Plugin disconnected');
       hostControlSock = null;
-      // Keep existing tunnels alive, reject future pending
+      // Kill all pending connections
       for (const [id, p] of pendingConns) {
-        p.playerSock.end('Connection rejected: host disconnected\n');
+        p.playerSock.end('Connection rejected: plugin disconnected\n');
         p.playerSock.destroy();
         pendingConns.delete(id);
       }
+      // Retry connection after 5 seconds
+      log('info', 'Reconnecting in 5s...');
+      setTimeout(connectToPlugin, 5000);
     });
 
-    ctrlSock.once('error', (e) => {
-      log('error', `Host control error: ${e.message}`);
+    sock.once('error', (e) => {
+      log('error', `Plugin control error: ${e.message}`);
       hostControlSock = null;
+      setTimeout(connectToPlugin, 5000);
     });
-  });
+  }
+
+  // Start connection
+  connectToPlugin();
 
   function handleControlMsg(line) {
-    const parts = line.split(' ');
-    const cmd = parts[0];
+    // Parse JSON from plugin
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch (e) {
+      sendToHost(JSON.stringify({ type: 'error', message: 'Invalid JSON: ' + e.message }));
+      return;
+    }
 
-    switch (cmd) {
-      case 'HELLO': {
-        // HELLO <dataIp> <dataPort> [mcTarget]
-        const dataIp = parts[1];
-        const dataPort = parseInt(parts[2], 10);
-        const providedMcTarget = parts.slice(3).join(':');
-        const slaveTarget = providedMcTarget || (mcTarget ? fmtAddr(mcTarget) : null);
-
-        if (!slaveTarget) {
-          log('error', 'Host did not provide MC server target, and none configured on Slave');
-          sendToHost('ERROR No MC server target configured');
+    switch (msg.type) {
+      case 'hello': {
+        // Plugin tells us its MC server port — we tunnel directly to it
+        const mcPort = msg.port;
+        if (!mcPort) {
+          sendToHost(JSON.stringify({ type: 'error', message: 'HELLO missing port' }));
           return;
         }
 
-        // Store the data listener address & MC target for this Host session
-        hostControlSock._dataAddr = { host: dataIp, port: dataPort };
-        hostControlSock._mcTarget = parseAddr(slaveTarget);
+        // The tunnel target is the plugin's address (home server IP)
+        // remoteAddress comes as "::ffff:123.45.67.89:25567" — strip [host]:port
+        let tunnelHost;
+        if (hostControlSock.remoteAddress.startsWith('::ffff:')) {
+            // IPv4-mapped IPv6: ::ffff:x.x.x.x
+          tunnelHost = hostControlSock.remoteAddress.replace(/^::ffff:/, '');
+        } else {
+          // Plain IPv4: "1.2.3.4"
+          tunnelHost = hostControlSock.remoteAddress;
+        }
+        // Strip port if present
+        const lastColon = tunnelHost.lastIndexOf(':');
+        if (lastColon >= 0) tunnelHost = tunnelHost.substring(0, lastColon);
 
-        log('ok', `Host data listener at ${c(C.cyan, `${dataIp}:${dataPort}`)}, MC target: ${c(C.cyan, slaveTarget)}`);
-        sendToHost('OK mcnux slave ready');
+        hostControlSock._mcTarget = { host: tunnelHost, port: mcPort };
+        log('ok', `Tunnel target: ${c(C.cyan, `${tunnelHost}:${mcPort}`)} — ready for approvals`);
         break;
       }
 
-      case 'APPROVE': {
-        // APPROVE <connId>
-        const connId = parts[1];
+      case 'approve': {
+        const connId = msg.connId;
         const pending = pendingConns.get(connId);
         if (!pending) {
-          sendToHost(`ERROR Connection ${connId} not found`);
+          sendToHost(JSON.stringify({ type: 'error', message: `Connection ${connId} not found` }));
           return;
         }
         pendingConns.delete(connId);
 
-        if (!hostControlSock._dataAddr) {
-          pending.playerSock.end('Proxy error: no data listener\n');
+        if (!hostControlSock._mcTarget) {
+          pending.playerSock.end('Proxy error: host not ready\n');
           pending.playerSock.destroy();
-          sendToHost(`ERROR No data listener configured for ${connId}`);
+          sendToHost(JSON.stringify({ type: 'error', message: `No MC target for ${connId}` }));
           return;
         }
 
-        // Connect to Host's data listener to establish tunnel
+        // Connect tunnel directly to the MC server (localhost on the plugin machine)
         const tunnelSock = new net.Socket();
-        const dataAddr = hostControlSock._dataAddr;
-        const mcTargetAddr = hostControlSock._mcTarget;
+        const mcTarget = hostControlSock._mcTarget;
 
         tunnelSock.once('error', (e) => {
-          log('error', `[${connId}] tunnel to Host ${fmtAddr(dataAddr)}: ${e.message}`);
+          log('error', `[${connId}] tunnel to MC ${fmtAddr(mcTarget)}: ${e.message}`);
           pending.playerSock.end('Proxy error: tunnel failed\n');
           pending.playerSock.destroy();
-          sendToHost(`ERROR Tunnel failed for ${connId}: ${e.message}`);
+          sendToHost(JSON.stringify({ type: 'error', message: `Tunnel failed: ${e.message}`, connId }));
         });
 
-        tunnelSock.connect(dataAddr.port, dataAddr.host, () => {
-          log('ok', `[${connId}] tunnel established to Host ${c(C.green, fmtAddr(dataAddr))}`);
+        tunnelSock.connect(mcTarget.port, mcTarget.host, () => {
+          log('ok', `[${connId}] tunnel established to MC ${c(C.green, fmtAddr(mcTarget))}`);
 
-          // Send connId header
-          tunnelSock.write(`${connId}\n`, 'utf8');
-
-          // Remove buffering listener and flush buffered data before bridging
+          // Remove buffering listener and flush buffered data
           pending.playerSock.removeListener('data', pending.onPlayerData);
           for (const chunk of pending.buffer) {
             if (tunnelSock.writable) tunnelSock.write(chunk);
           }
 
-          // Bridge player ↔ tunnel
+          // Bridge player ↔ MC server
           const bridge = bridgeSockets(pending.playerSock, tunnelSock);
 
           const session = {
@@ -337,7 +374,6 @@ function runServe(playerPort, controlPort, opts) {
             tunnelBytes.up += bridge.bytesUp();
             tunnelBytes.down += bridge.bytesDown();
             activeConns.delete(connId);
-            sendToHost(`TUNNEL_CLOSE ${connId}`);
             log('disc', `[${connId}] player disconnected ${c(C.dim, pending.playerAddr)}`);
             bridge.cleanup();
           });
@@ -347,58 +383,34 @@ function runServe(playerPort, controlPort, opts) {
             tunnelBytes.up += bridge.bytesUp();
             tunnelBytes.down += bridge.bytesDown();
             activeConns.delete(connId);
-            sendToHost(`TUNNEL_CLOSE ${connId}`);
             log('disc', `[${connId}] tunnel closed`);
             bridge.cleanup();
           });
 
           const hs = pending.handshake;
           if (hs) {
-            log('info', `[${connId}] tunnel active — ${c(C.dim, `${pending.playerAddr} → ${mcTargetAddr.host}:${mcTargetAddr.port}`)}`);
+            log('info', `[${connId}] tunnel active — ${c(C.dim, `${pending.playerAddr} → ${mcTarget.host}:${mcTarget.port}`)}`);
           }
         });
         break;
       }
 
-      case 'DENY': {
-        // DENY <connId>
-        const connId = parts[1];
+      case 'deny': {
+        const connId = msg.connId;
         const pending = pendingConns.get(connId);
         if (!pending) {
-          sendToHost(`ERROR Connection ${connId} not found`);
+          sendToHost(JSON.stringify({ type: 'error', message: `Connection ${connId} not found` }));
           return;
         }
         pendingConns.delete(connId);
         pending.playerSock.end('Connection rejected by administrator\n');
         pending.playerSock.destroy();
         log('info', `[${connId}] denied ${c(C.dim, pending.playerAddr)}`);
-        sendToHost(`OK Denied ${connId}`);
-        break;
-      }
-
-      case 'LIST_CONNS': {
-        // Return list of pending connections
-        const list = [];
-        for (const [id, p] of pendingConns) {
-          const hs = p.handshake;
-          const info = hs ? `${hs.serverAddress}:${hs.serverPort}` : '';
-          list.push(`${id}:${p.playerAddr}:${info}`);
-        }
-        sendToHost(`CONNS ${list.join(' ')}`);
-        break;
-      }
-
-      case 'LIST_ACTIVE': {
-        const list = [];
-        for (const [id, s] of activeConns) {
-          list.push(`${id}:${s.playerAddr}`);
-        }
-        sendToHost(`ACTIVE ${list.join(' ')}`);
         break;
       }
 
       default:
-        sendToHost(`ERROR Unknown command: ${cmd}`);
+        sendToHost(JSON.stringify({ type: 'error', message: `Unknown type: ${msg.type}` }));
     }
   }
 
@@ -416,20 +428,15 @@ function runServe(playerPort, controlPort, opts) {
 
     // Buffer all player data while pending for replay after approval
     const playerBuf = [];
-    let handshakeData = null;
-    let handshakeLogged = false;
+    let playerName = null;
 
     function onPlayerData(data) {
-      if (!handshakeLogged) {
-        handshakeLogged = true;
-        const hs = parseHandshake(data);
-        if (hs) {
-          handshakeData = hs;
-          log('info', `[${id}] handshake: ${c(C.bold, hs.serverAddress)}:${hs.serverPort} (${hs.nextStateName})`);
-          sendToHost(`HANDSHAKE ${id} ${hs.serverAddress} ${hs.serverPort}`);
-        }
-      }
-      // Buffer ALL data while pending — will be flushed after approval
+      const buf = Buffer.concat([...playerBuf, data]);
+      // Try to extract player name from login start packet (after handshake)
+      // Login start packet (0x00) contains the player name
+      const extracted = extractPlayerName(buf);
+      if (extracted) playerName = extracted;
+
       playerBuf.push(data);
     }
     playerSock.on('data', onPlayerData);
@@ -446,14 +453,25 @@ function runServe(playerPort, controlPort, opts) {
     };
     pendingConns.set(id, pending);
 
-    sendToHost(`CONN_REQ ${id} ${playerAddr}`);
+    // Send JSON connect request to plugin control server
+    // playerName may be 'unknown' if we haven't parsed the login packet yet
+    const connectMsg = JSON.stringify({
+      type: 'connect',
+      connId: id,
+      playerName: playerName || 'unknown',
+      playerUuid: 'unknown', // not available until online-mode auth
+      playerIp: playerSock.remoteAddress?.replace(/^::ffff:/, '') || '0.0.0.0',
+      playerPort: playerSock.remotePort || 0,
+      proxyHost: playerAddr,
+    }) + '\n';
+    sendToHost(connectMsg);
 
     // Handle player disconnect while pending
     playerSock.once('close', () => {
       if (pendingConns.has(id)) {
         pendingConns.delete(id);
         log('disc', `[${id}] player disconnected (pending) ${c(C.dim, playerAddr)}`);
-        sendToHost(`CONN_LOST ${id}`);
+        sendToHost(JSON.stringify({ type: 'disconnect', connId: id }) + '\n');
       }
     });
 
@@ -461,7 +479,7 @@ function runServe(playerPort, controlPort, opts) {
       if (pendingConns.has(id)) {
         pendingConns.delete(id);
         log('error', `[${id}] player error: ${e.message}`);
-        sendToHost(`CONN_LOST ${id} ${e.message}`);
+        sendToHost(JSON.stringify({ type: 'disconnect', connId: id }));
       }
     });
 
@@ -472,7 +490,6 @@ function runServe(playerPort, controlPort, opts) {
         playerSock.end('Connection timed out awaiting approval\n');
         playerSock.destroy();
         log('warn', `[${id}] pending timeout ${c(C.dim, playerAddr)}`);
-        sendToHost(`CONN_LOST ${id} timeout`);
       }
     }, 120000);
   });
@@ -518,24 +535,13 @@ function runServe(playerPort, controlPort, opts) {
   // Start player server
   playerServer.listen(playerPort, '0.0.0.0', () => {
     log('ok', `Slave listening for players on ${c(C.bold, `:${playerPort}`)}`);
-    log('ok', `Control port for Host on ${c(C.bold, `:${controlPort}`)}`);
     log('info', `Players connect to this machine on port ${c(C.cyan, String(playerPort))}`);
-    log('info', `Host connects to control port ${c(C.cyan, String(controlPort))}`);
+    log('info', `Connecting to plugin control at ${c(C.cyan, `${pluginHost}:${pluginPort}`)}`);
   });
 
   playerServer.once('error', (err) => {
     if (err.code === 'EADDRINUSE') die(`Port ${playerPort} is already in use`);
     die(`Player server error: ${err.message}`);
-  });
-
-  // Start control server
-  controlServer.listen(controlPort, '0.0.0.0', () => {
-    log('ok', `Control server ready on port ${c(C.bold, String(controlPort))}`);
-  });
-
-  controlServer.once('error', (err) => {
-    if (err.code === 'EADDRINUSE') die(`Control port ${controlPort} is already in use`);
-    die(`Control server error: ${err.message}`);
   });
 
   // Stats display
@@ -1121,10 +1127,12 @@ function main() {
 
     case 'serve': {
       const playerPort = parseInt(positional[0], 10) || 25565;
-      const controlPort = parseInt(positional[1], 10) || 25567;
+      const pluginHost = positional[1];
+      const pluginPort = parseInt(positional[2], 10) || 25567;
+      if (!pluginHost) die('Usage: mcnux serve [player-port] <plugin-host> <plugin-control-port>\n  Example: mcnux serve 25565 192.168.1.100 25567');
       if (isNaN(playerPort) || playerPort < 1) die(`Invalid player port: ${positional[0] || '25565'}`);
-      if (isNaN(controlPort) || controlPort < 1) die(`Invalid control port: ${positional[1] || '25567'}`);
-      runServe(playerPort, controlPort, opts);
+      if (isNaN(pluginPort) || pluginPort < 1) die(`Invalid plugin control port: ${positional[2] || '25567'}`);
+      runServe(playerPort, pluginHost, pluginPort, opts);
       break;
     }
 
