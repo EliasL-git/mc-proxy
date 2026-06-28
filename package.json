@@ -1,8 +1,9 @@
 {
-  "name": "mc-proxy",
+  "name": "mcnux",
   "version": "1.0.0",
-  "description": "Two-agent Minecraft proxy: Host connects to the real server, Slave accepts players",
+  "description": "Two-agent Minecraft proxy: connect (Host) + serve (Slave). Zero npm deps.",
   "bin": {
+    "mcnux": "./mcnux.js",
     "mc-proxy-host": "./mc-proxy-host.js",
     "mc-proxy-slave": "./mc-proxy-slave.js"
   },
@@ -15,6 +16,7 @@
     "node": ">=18.0.0"
   },
   "files": [
+    "mcnux.js",
     "mc-proxy-host.js",
     "mc-proxy-slave.js"
   ]
