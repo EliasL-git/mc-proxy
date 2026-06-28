@@ -1,12 +1,16 @@
 # mcnux — Minecraft Proxy CLI
 
-Two-agent Minecraft proxy with zero npm dependencies.
+Zero-dependency Minecraft server proxy with connection approval.
+
+## Architecture
 
 ```
-Client  <->  mcnux serve :25565  <->  mcnux connect :25566  <->  MC Server
+Player → Slave :25565 (pending queue) → Host approves → tunnel → MC Server
 ```
 
-Players join the **Slave** (public-facing), traffic gets relayed through the **Host** to the real server.
+Two components working together:
+- **Slave** — runs on a public-facing machine, accepts player connections (but queues them for approval)
+- **Host** — runs on the MC server machine, connects to Slave, shows pending connections and lets you approve/deny them
 
 ## Install
 
@@ -14,81 +18,85 @@ Players join the **Slave** (public-facing), traffic gets relayed through the **H
 npm install -g mcnux
 ```
 
-Then `mcnux --help` anywhere. That's it — no other setup.
+Or run directly:
 
-## Architecture
-
-Two processes connect to create one tunnel:
-
-- **Host** (`mcnux connect`) — runs on the machine that runs the Minecraft server, or on a machine on the same local network. Low latency to the MC server is critical.
-- **Slave** (`mcnux serve`) — runs on a public-facing machine. Players connect here, traffic gets relayed through the Host to the MC server.
-
-The tunnel is plain TCP — no npm deps, Node built-ins only.
+```bash
+node mcnux.js serve
+node mcnux.js host 192.168.1.100 25567
+```
 
 ## Usage
 
-### Host mode
-
-Runs on the Minecraft server machine (or same LAN). Listens for Slave connections, forwards to the real MC server.
-
-```
-mcnux connect <listen-addr> <target-addr>
-```
-
-| Argument | Description | Default |
-|---|---|---|
-| `<listen-addr>` | Address to listen for Slave connections | `0.0.0.0:25566` |
-| `<target-addr>` | Minecraft server address (use `localhost` if on the same machine) | `localhost:25565` |
+### 1. Start the Slave (public machine)
 
 ```bash
-# MC server on the same machine — forward via localhost
-mcnux connect 0.0.0.0:25566 localhost:25565
-
-# MC server on a different machine on the same LAN
-mcnux connect 0.0.0.0:25566 192.168.1.10:25565
-
-# Verbose mode — see all packet traffic
-mcnux connect 0.0.0.0:25566 192.168.1.10:25565 -v
+mcnux serve [player-port] [control-port]
 ```
 
-### Slave mode
+Default player port: `25565` — players connect here
+Default control port: `25567` — Host connects here
 
-Runs on a public-facing machine. Accepts Minecraft clients, relays through the Host.
+Players who connect are **queued pending approval**. They wait until the Host approves them.
 
-```
-mcnux serve <listen-addr> <host-addr>
-```
-
-| Argument | Description | Default |
-|---|---|---|
-| `<listen-addr>` | Address to listen for players | `0.0.0.0:25565` |
-| `<host-addr>` | Host address to relay through | `localhost:25566` |
+### 2. Start the Host (MC server machine)
 
 ```bash
-# Basic — accept players on :25565, relay through Host at 10.0.0.1:25566
-mcnux serve 0.0.0.0:25565 10.0.0.1:25566
-
-# With verbose packet dump
-mcnux serve 0.0.0.0:25565 host.example.com:25566 -v
+mcnux host <slave-host> <control-port> [--mc-server <addr>]
 ```
 
-### Options
+Connects to the Slave's control port and gives you an interactive prompt:
+
+```
+mcnux host>
+```
+
+#### Host Commands
+
+| Command | Description |
+|---------|-------------|
+| `connections` | List pending players |
+| `approve <id>` | Let a player through |
+| `deny <id>` | Reject a player |
+| `active` | Show active tunnels |
+| `refresh` | Re-fetch pending list |
+| `help` | Show available commands |
+| `exit` | Disconnect and quit |
+
+### Example
+
+```bash
+# On your public VPS (Slave):
+mcnux serve
+
+# On your Minecraft server machine (Host):
+mcnux host 203.0.113.5 25567
+
+# When a player connects, you'll see:
+# ➜ [1] New connection from 203.0.113.50:54321 — type "approve 1" to allow
+mcnux host> approve 1
+# ✓ Approved connection 1
+# Data flows through the tunnel
+```
+
+## Options
 
 | Flag | Description |
-|---|---|
-| `-v`, `--verbose` | Hex-dump all packet traffic |
-| `--no-color` | Disable ANSI colors |
-| `-h`, `--help` | Show help |
+|------|-------------|
+| `--mc-server <addr>` | Target Minecraft server (default: `localhost:25565`) |
+| `--no-color` | Disable ANSI colored output |
+| `-h, --help` | Show help |
 | `--version` | Print version |
 
-## Features
+## How it works
 
-- **Zero npm dependencies** — only Node.js built-ins (`net`, `dns`)
-- **Minecraft-aware** — parses and logs handshake packets (protocol version, server address, next state)
-- **Hex dump** — `-v` shows packet-level traffic in `hexdump -C` format
-- **Live stats** — byte counters, transfer rates, connection counts, uptime (updates every 10s)
-- **Clean shutdown** — drains active connections on SIGINT/SIGTERM
+1. Players connect to the **Slave** on the public port
+2. The Slave buffers their connection and notifies the **Host** via the control channel
+3. The Host admin runs the interactive CLI — they see pending connections and **approve or deny** them
+4. On approval, the Slave opens a direct TCP tunnel to the Host, which connects to the Minecraft server
+5. All traffic flows: **Player ↔ Slave ↔ Host ↔ MC Server**
+6. The Host controls exactly who gets through — no unwanted connections
 
-## License
+## Requirements
 
-MIT
+- Node.js >= 18
+- Zero npm dependencies — uses only built-in `net` and `readline` modules

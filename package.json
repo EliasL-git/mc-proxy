@@ -1,6 +1,7 @@
 {
   "name": "mcnux",
-  "version": "1.0.0",
+  "type": "commonjs",
+  "version": "2.0.0",
   "description": "Two-agent Minecraft proxy: connect (Host) + serve (Slave). Zero npm deps.",
   "bin": {
     "mcnux": "./mcnux.js"

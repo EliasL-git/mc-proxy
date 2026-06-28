@@ -3,14 +3,14 @@
 /**
  * mcnux — Minecraft Proxy CLI
  * ===========================
- * Two-agent proxy: connect (Host) + serve (Slave).
+ * Two-agent proxy with connection approval.
  *
  * Architecture:
- *   Client <-> Slave :25565 <-> TCP :25566 <-> Host :25566 <-> MC Server
+ *   Player → Slave :25565 (pending) → Host (approves) → Slave tunnels to Host data listener → MC Server
  *
  * Commands:
- *   connect  <listen-addr> <target-addr>    Host — listen for Slave, forward to MC server
- *   serve    <listen-addr> <host-addr>      Slave — accept clients, relay through Host
+ *   host   <slave-host> <control-port>    Admin — connect to Slave, approve/deny connections
+ *   serve  [player-port] [control-port]   Public — accept players, queue for approval
  *
  * MIT License
  */
@@ -18,13 +18,13 @@
 'use strict';
 
 const net = require('net');
-const dns = require('dns');
+const readline = require('readline');
 
 // ───────────────────────────────────────────────────────────────
 //  Version
 // ───────────────────────────────────────────────────────────────
 
-const VERSION = '1.0.0';
+const VERSION = '2.0.0';
 
 // ───────────────────────────────────────────────────────────────
 //  ANSI Colors
@@ -63,7 +63,6 @@ function log(level, msg, extra = '') {
   const l = LOG_TAGS[level] || LOG_TAGS.info;
   console.log(`${ts()} ${c(l.c, l.t)} ${msg}${extra ? ' ' + extra : ''}`);
 }
-function raw(t) { console.log(t); }
 function die(msg) { console.error(color ? `${C.red}✗${C.reset} ${msg}` : `✗ ${msg}`); process.exit(1); }
 
 // ───────────────────────────────────────────────────────────────
@@ -75,37 +74,21 @@ function fmtBytes(n) {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
   return `${(n / (1024 * 1024)).toFixed(1)}MB`;
 }
-function fmtRate(n) { return `${fmtBytes(n)}/s`; }
 
-function parseAddr(str) {
+function parseAddr(str, defaultPort = 25565) {
   if (!str) return null;
   const colon = str.lastIndexOf(':');
-  if (colon === -1) return { host: str, port: 25565 };
+  if (colon === -1) return { host: str, port: defaultPort };
   const host = str.slice(0, colon);
   const portStr = colon > 0 && str[colon - 1] === ']'
     ? str.slice(str.lastIndexOf(']:') + 2)
     : str.slice(colon + 1);
   const port = parseInt(portStr, 10);
-  if (isNaN(port)) return { host: str, port: 25565 };
+  if (isNaN(port)) return { host: str, port: defaultPort };
   return { host: host || 'localhost', port };
 }
 
 function fmtAddr(a) { return `${a.host}:${a.port}`; }
-
-// ───────────────────────────────────────────────────────────────
-//  Hex Dump
-// ───────────────────────────────────────────────────────────────
-
-function hexDump(buf) {
-  const lines = [];
-  for (let i = 0; i < buf.length; i += 16) {
-    const slice = buf.slice(i, Math.min(i + 16, buf.length));
-    const hex = Array.from(slice).map(b => b.toString(16).padStart(2, '0')).join(' ');
-    const ascii = Array.from(slice).map(b => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.')).join('');
-    lines.push(`  ${c(C.dim, i.toString(16).padStart(4, '0'))}  ${hex.padEnd(47)} \u2502${ascii}\u2502`);
-  }
-  return lines.join('\n');
-}
 
 // ───────────────────────────────────────────────────────────────
 //  Minecraft VarInt + Handshake Parser
@@ -161,58 +144,12 @@ function parseHandshake(buf) {
 }
 
 // ───────────────────────────────────────────────────────────────
-//  Stats
+//  Bridge — pipes data between two sockets
 // ───────────────────────────────────────────────────────────────
 
-class Stats {
-  constructor(label) {
-    this.label = label;
-    this.total = 0;
-    this.active = 0;
-    this.idCounter = 0;
-    this.bytesUp = 0;
-    this.bytesDown = 0;
-    this.start = Date.now();
-    this._lu = 0; this._ld = 0; this._lt = Date.now();
-  }
-
-  open() { this.total++; this.active++; this.idCounter++; return this.idCounter; }
-  close() { this.active--; }
-  up(n) { this.bytesUp += n; }
-  down(n) { this.bytesDown += n; }
-
-  rate() {
-    const now = Date.now();
-    const e = (now - this._lt) / 1000;
-    if (e < 0.1) return { up: 0, down: 0 };
-    const r = { up: Math.round((this.bytesUp - this._lu) / e), down: Math.round((this.bytesDown - this._ld) / e) };
-    this._lu = this.bytesUp; this._ld = this.bytesDown; this._lt = now;
-    return r;
-  }
-
-  uptime() { return Math.floor((Date.now() - this.start) / 1000); }
-
-  display() {
-    const ru = this.uptime();
-    const h = Math.floor(ru / 3600), m = Math.floor((ru % 3600) / 60), s = ru % 60;
-    const u = h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
-    const rt = this.rate();
-    log('stat', `${c(C.bold, this.label)} stats:`);
-    log('stat', `  Uptime:   ${u}`);
-    log('stat', `  Active:   ${c(C.cyan, String(this.active))} connections`);
-    log('stat', `  Total:    ${this.total} connections`);
-    log('stat', `  Up:       ${fmtBytes(this.bytesUp)} ${c(C.dim, `(${fmtRate(rt.up)})`)}`);
-    log('stat', `  Down:     ${fmtBytes(this.bytesDown)} ${c(C.dim, `(${fmtRate(rt.down)})`)}`);
-  }
-}
-
-// ───────────────────────────────────────────────────────────────
-//  Session — relays data between two sockets
-// ───────────────────────────────────────────────────────────────
-
-function bridgeSockets(id, sockA, sockB, labelA, labelB, verbose) {
+function bridgeSockets(sockA, sockB, onStats) {
   let closed = false;
-  let bytesAtoB = 0, bytesBtoA = 0;
+  let aToB = 0, bToA = 0;
 
   function cleanup() {
     if (closed) return;
@@ -221,211 +158,821 @@ function bridgeSockets(id, sockA, sockB, labelA, labelB, verbose) {
     if (!sockB.destroyed) { sockB.end(); sockB.destroy(); }
   }
 
-  function pipe(src, dst, dir, label) {
+  function pipe(src, dst, dir) {
     src.on('data', (data) => {
       if (closed) return;
-      if (dir === 'up') bytesAtoB += data.length;
-      else bytesBtoA += data.length;
-
-      if (verbose) {
-        log('data', c(dir === 'up' ? C.blue : C.magenta, `[${id}] ${dir === 'up' ? '↑' : '↓'} ${data.length} bytes ${label}`));
-        raw(hexDump(data));
-      }
+      if (dir === 'up') aToB += data.length;
+      else bToA += data.length;
       if (dst.writable) dst.write(data);
     });
   }
 
-  pipe(sockA, sockB, 'up', labelA);
-  pipe(sockB, sockA, 'down', labelB);
+  pipe(sockA, sockB, 'up');
+  pipe(sockB, sockA, 'down');
 
-  sockA.once('close', () => { if (!closed) { cleanup(); } });
-  sockA.once('error', (e) => { if (!closed) { log('error', `[${id}] ${labelA} error: ${e.message}`); cleanup(); } });
-  sockB.once('close', () => { if (!closed) { cleanup(); } });
-  sockB.once('error', (e) => { if (!closed) { log('error', `[${id}] ${labelB} error: ${e.message}`); cleanup(); } });
+  sockA.once('close', cleanup);
+  sockA.once('error', cleanup);
+  sockB.once('close', cleanup);
+  sockB.once('error', cleanup);
 
   return {
-    getBytesUp: () => bytesAtoB,
-    getBytesDown: () => bytesBtoA,
     cleanup,
+    bytesUp: () => aToB,
+    bytesDown: () => bToA,
     isClosed: () => closed,
   };
 }
 
 // ───────────────────────────────────────────────────────────────
-//  CONNECT command — Host mode
-//  Listens for Slave connections, relays to MC server
+//  SERVE — Slave mode
+//  Listens for Minecraft players AND control connections from Host
 // ───────────────────────────────────────────────────────────────
 
-function runConnect(listenAddr, targetAddr, opts) {
-  const stats = new Stats('mcnux connect');
+function runServe(playerPort, controlPort, opts) {
   const verbose = opts.verbose;
+  const mcTarget = opts.mcTarget ? parseAddr(opts.mcTarget) : null;
 
-  log('info', `${c(C.bold, 'mcnux connect')} ${c(C.dim, `v${VERSION}`)}`);
-  log('info', `  listen for Slave → ${c(C.cyan, fmtAddr(listenAddr))}`);
-  log('info', `  forward to MC    → ${c(C.cyan, fmtAddr(targetAddr))}`);
+  // ── Slave State ──────────────────────────────────────────
+  let hostControlSock = null;          // connected Host's control socket
+  const pendingConns = new Map();      // id -> { id, playerSock, playerAddr, bytes, handshake }
+  const activeConns = new Map();       // id -> { id, playerSock, tunnelSock, bridge, bytes, handshake }
+  let connIdCounter = 0;
 
-  const server = net.createServer((slaveSock) => {
-    const id = stats.open();
-    const slaveAddr = `${slaveSock.remoteAddress}:${slaveSock.remotePort}`;
-    log('conn', `[${id}] Slave connected ${c(C.cyan, slaveAddr)}`, c(C.dim, 'connecting to MC server...'));
+  // Track bytes in active tunnels
+  const tunnelBytes = { up: 0, down: 0 };
 
-    const resolveStart = Date.now();
-    dns.lookup(targetAddr.host, { all: false }, (err, address) => {
-      if (err) {
-        log('error', `[${id}] DNS failed for ${targetAddr.host}: ${err.message}`);
-        slaveSock.end(); stats.close(); return;
+  function genConnId() { return String(++connIdCounter); }
+
+  function sendToHost(msg) {
+    if (!hostControlSock || hostControlSock.destroyed) return;
+    try { hostControlSock.write(msg + '\n'); } catch (_) {}
+  }
+
+  // ── Control Server (for Host connections) ────────────────
+  const controlServer = net.createServer((ctrlSock) => {
+    if (hostControlSock && !hostControlSock.destroyed) {
+      log('warn', 'Host already connected — rejecting duplicate');
+      ctrlSock.end('BUSY Another host is already connected\n');
+      return;
+    }
+
+    const hostAddr = `${ctrlSock.remoteAddress}:${ctrlSock.remotePort}`;
+    log('ok', `Host connected from ${c(C.cyan, hostAddr)}`);
+    hostControlSock = ctrlSock;
+
+    // Buffer for partial line reads
+    let buf = '';
+
+    ctrlSock.on('data', (chunk) => {
+      buf += chunk.toString();
+      while (buf.includes('\n')) {
+        const nlIdx = buf.indexOf('\n');
+        const line = buf.slice(0, nlIdx).trim();
+        buf = buf.slice(nlIdx + 1);
+        if (!line) continue;
+        handleControlMsg(line);
       }
-      const resolveMs = Date.now() - resolveStart;
-      if (resolveMs > 50) log('warn', `[${id}] DNS lookup took ${resolveMs}ms (${targetAddr.host} → ${address})`);
+    });
 
-      const mcSock = new net.Socket();
-      mcSock.once('error', (e) => {
-        if (mcSock.destroyed) return;
-        log('error', `[${id}] MC server ${fmtAddr(targetAddr)}: ${e.message}`);
-        slaveSock.end(); stats.close();
-      });
+    ctrlSock.once('close', () => {
+      log('warn', `Host disconnected ${c(C.dim, hostAddr)}`);
+      hostControlSock = null;
+      // Keep existing tunnels alive, reject future pending
+      for (const [id, p] of pendingConns) {
+        p.playerSock.end('Connection rejected: host disconnected\n');
+        p.playerSock.destroy();
+        pendingConns.delete(id);
+      }
+    });
 
-      mcSock.connect(targetAddr.port, address, () => {
-        if (slaveSock.destroyed) return;
-        log('ok', `[${id}] tunnel ${c(C.green, fmtAddr(targetAddr))}`);
-
-        const bridge = bridgeSockets(id, slaveSock, mcSock,
-          `Slave ${slaveAddr}`, `MC ${fmtAddr(targetAddr)}`, verbose);
-
-        slaveSock.once('close', () => {
-          if (bridge.isClosed()) return;
-          log('disc', `[${id}] Slave disconnected ${c(C.dim, slaveAddr)}`);
-          stats.close();
-          stats.up(bridge.getBytesUp());
-          stats.down(bridge.getBytesDown());
-          log('info', `[${id}] tunnel closed — ↑${fmtBytes(bridge.getBytesUp())} ↓${fmtBytes(bridge.getBytesDown())}`);
-          bridge.cleanup();
-        });
-
-        mcSock.once('close', () => {
-          if (bridge.isClosed()) return;
-          log('disc', `[${id}] MC server disconnected`);
-          stats.close();
-          stats.up(bridge.getBytesUp());
-          stats.down(bridge.getBytesDown());
-          log('info', `[${id}] tunnel closed — ↑${fmtBytes(bridge.getBytesUp())} ↓${fmtBytes(bridge.getBytesDown())}`);
-          bridge.cleanup();
-        });
-      });
+    ctrlSock.once('error', (e) => {
+      log('error', `Host control error: ${e.message}`);
+      hostControlSock = null;
     });
   });
 
-  return startServer(server, listenAddr, stats, 'connect');
+  function handleControlMsg(line) {
+    const parts = line.split(' ');
+    const cmd = parts[0];
+
+    switch (cmd) {
+      case 'HELLO': {
+        // HELLO <dataIp> <dataPort> [mcTarget]
+        const dataIp = parts[1];
+        const dataPort = parseInt(parts[2], 10);
+        const providedMcTarget = parts.slice(3).join(':');
+        const slaveTarget = providedMcTarget || (mcTarget ? fmtAddr(mcTarget) : null);
+
+        if (!slaveTarget) {
+          log('error', 'Host did not provide MC server target, and none configured on Slave');
+          sendToHost('ERROR No MC server target configured');
+          return;
+        }
+
+        // Store the data listener address & MC target for this Host session
+        hostControlSock._dataAddr = { host: dataIp, port: dataPort };
+        hostControlSock._mcTarget = parseAddr(slaveTarget);
+
+        log('ok', `Host data listener at ${c(C.cyan, `${dataIp}:${dataPort}`)}, MC target: ${c(C.cyan, slaveTarget)}`);
+        sendToHost('OK mcnux slave ready');
+        break;
+      }
+
+      case 'APPROVE': {
+        // APPROVE <connId>
+        const connId = parts[1];
+        const pending = pendingConns.get(connId);
+        if (!pending) {
+          sendToHost(`ERROR Connection ${connId} not found`);
+          return;
+        }
+        pendingConns.delete(connId);
+
+        if (!hostControlSock._dataAddr) {
+          pending.playerSock.end('Proxy error: no data listener\n');
+          pending.playerSock.destroy();
+          sendToHost(`ERROR No data listener configured for ${connId}`);
+          return;
+        }
+
+        // Connect to Host's data listener to establish tunnel
+        const tunnelSock = new net.Socket();
+        const dataAddr = hostControlSock._dataAddr;
+        const mcTargetAddr = hostControlSock._mcTarget;
+
+        tunnelSock.once('error', (e) => {
+          log('error', `[${connId}] tunnel to Host ${fmtAddr(dataAddr)}: ${e.message}`);
+          pending.playerSock.end('Proxy error: tunnel failed\n');
+          pending.playerSock.destroy();
+          sendToHost(`ERROR Tunnel failed for ${connId}: ${e.message}`);
+        });
+
+        tunnelSock.connect(dataAddr.port, dataAddr.host, () => {
+          log('ok', `[${connId}] tunnel established to Host ${c(C.green, fmtAddr(dataAddr))}`);
+
+          // Send connId header
+          tunnelSock.write(`${connId}\n`, 'utf8');
+
+          // Remove buffering listener and flush buffered data before bridging
+          pending.playerSock.removeListener('data', pending.onPlayerData);
+          for (const chunk of pending.buffer) {
+            if (tunnelSock.writable) tunnelSock.write(chunk);
+          }
+
+          // Bridge player ↔ tunnel
+          const bridge = bridgeSockets(pending.playerSock, tunnelSock);
+
+          const session = {
+            id: connId,
+            playerSock: pending.playerSock,
+            tunnelSock,
+            bridge,
+            handshake: pending.handshake,
+            playerAddr: pending.playerAddr,
+          };
+          activeConns.set(connId, session);
+
+          pending.playerSock.once('close', () => {
+            if (bridge.isClosed()) return;
+            tunnelBytes.up += bridge.bytesUp();
+            tunnelBytes.down += bridge.bytesDown();
+            activeConns.delete(connId);
+            sendToHost(`TUNNEL_CLOSE ${connId}`);
+            log('disc', `[${connId}] player disconnected ${c(C.dim, pending.playerAddr)}`);
+            bridge.cleanup();
+          });
+
+          tunnelSock.once('close', () => {
+            if (bridge.isClosed()) return;
+            tunnelBytes.up += bridge.bytesUp();
+            tunnelBytes.down += bridge.bytesDown();
+            activeConns.delete(connId);
+            sendToHost(`TUNNEL_CLOSE ${connId}`);
+            log('disc', `[${connId}] tunnel closed`);
+            bridge.cleanup();
+          });
+
+          const hs = pending.handshake;
+          if (hs) {
+            log('info', `[${connId}] tunnel active — ${c(C.dim, `${pending.playerAddr} → ${mcTargetAddr.host}:${mcTargetAddr.port}`)}`);
+          }
+        });
+        break;
+      }
+
+      case 'DENY': {
+        // DENY <connId>
+        const connId = parts[1];
+        const pending = pendingConns.get(connId);
+        if (!pending) {
+          sendToHost(`ERROR Connection ${connId} not found`);
+          return;
+        }
+        pendingConns.delete(connId);
+        pending.playerSock.end('Connection rejected by administrator\n');
+        pending.playerSock.destroy();
+        log('info', `[${connId}] denied ${c(C.dim, pending.playerAddr)}`);
+        sendToHost(`OK Denied ${connId}`);
+        break;
+      }
+
+      case 'LIST_CONNS': {
+        // Return list of pending connections
+        const list = [];
+        for (const [id, p] of pendingConns) {
+          const hs = p.handshake;
+          const info = hs ? `${hs.serverAddress}:${hs.serverPort}` : '';
+          list.push(`${id}:${p.playerAddr}:${info}`);
+        }
+        sendToHost(`CONNS ${list.join(' ')}`);
+        break;
+      }
+
+      case 'LIST_ACTIVE': {
+        const list = [];
+        for (const [id, s] of activeConns) {
+          list.push(`${id}:${s.playerAddr}`);
+        }
+        sendToHost(`ACTIVE ${list.join(' ')}`);
+        break;
+      }
+
+      default:
+        sendToHost(`ERROR Unknown command: ${cmd}`);
+    }
+  }
+
+  // ── Player Server ─────────────────────────────────────────
+  const playerServer = net.createServer((playerSock) => {
+    if (!hostControlSock || hostControlSock.destroyed) {
+      playerSock.end('Proxy: no host connected — try again later\n');
+      playerSock.destroy();
+      return;
+    }
+
+    const id = genConnId();
+    const playerAddr = `${playerSock.remoteAddress}:${playerSock.remotePort}`;
+    log('conn', `[${id}] player connected ${c(C.cyan, playerAddr)}`, c(C.dim, 'queued for approval'));
+
+    // Buffer all player data while pending for replay after approval
+    const playerBuf = [];
+    let handshakeData = null;
+    let handshakeLogged = false;
+
+    function onPlayerData(data) {
+      if (!handshakeLogged) {
+        handshakeLogged = true;
+        const hs = parseHandshake(data);
+        if (hs) {
+          handshakeData = hs;
+          log('info', `[${id}] handshake: ${c(C.bold, hs.serverAddress)}:${hs.serverPort} (${hs.nextStateName})`);
+          sendToHost(`HANDSHAKE ${id} ${hs.serverAddress} ${hs.serverPort}`);
+        }
+      }
+      // Buffer ALL data while pending — will be flushed after approval
+      playerBuf.push(data);
+    }
+    playerSock.on('data', onPlayerData);
+
+    // Create pending session
+    const pending = {
+      id,
+      playerSock,
+      playerAddr,
+      handshake: null,
+      bytes: 0,
+      buffer: playerBuf,
+      onPlayerData,
+    };
+    pendingConns.set(id, pending);
+
+    sendToHost(`CONN_REQ ${id} ${playerAddr}`);
+
+    // Handle player disconnect while pending
+    playerSock.once('close', () => {
+      if (pendingConns.has(id)) {
+        pendingConns.delete(id);
+        log('disc', `[${id}] player disconnected (pending) ${c(C.dim, playerAddr)}`);
+        sendToHost(`CONN_LOST ${id}`);
+      }
+    });
+
+    playerSock.once('error', (e) => {
+      if (pendingConns.has(id)) {
+        pendingConns.delete(id);
+        log('error', `[${id}] player error: ${e.message}`);
+        sendToHost(`CONN_LOST ${id} ${e.message}`);
+      }
+    });
+
+    // Timeout pending connections after 2 minutes
+    setTimeout(() => {
+      if (pendingConns.has(id)) {
+        pendingConns.delete(id);
+        playerSock.end('Connection timed out awaiting approval\n');
+        playerSock.destroy();
+        log('warn', `[${id}] pending timeout ${c(C.dim, playerAddr)}`);
+        sendToHost(`CONN_LOST ${id} timeout`);
+      }
+    }, 120000);
+  });
+
+  // ── Start Servers ─────────────────────────────────────────
+  let shutdownTimer = null;
+
+  function shutdown() {
+    log('info', c(C.yellow, 'shutting down...'));
+
+    // Close player server (no new connections)
+    playerServer.close(() => {});
+
+    // Close control server
+    controlServer.close(() => {});
+
+    // Close all pending connections
+    for (const [id, p] of pendingConns) {
+      p.playerSock.end('Proxy shutting down\n');
+      p.playerSock.destroy();
+      pendingConns.delete(id);
+    }
+
+    // Close all active tunnels
+    for (const [id, s] of activeConns) {
+      s.bridge.cleanup();
+      activeConns.delete(id);
+    }
+
+    // Disconnect Host
+    if (hostControlSock && !hostControlSock.destroyed) {
+      hostControlSock.end();
+      hostControlSock.destroy();
+    }
+
+    log('ok', 'goodbye');
+    clearTimeout(shutdownTimer);
+  }
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // Start player server
+  playerServer.listen(playerPort, '0.0.0.0', () => {
+    log('ok', `Slave listening for players on ${c(C.bold, `:${playerPort}`)}`);
+    log('ok', `Control port for Host on ${c(C.bold, `:${controlPort}`)}`);
+    log('info', `Players connect to this machine on port ${c(C.cyan, String(playerPort))}`);
+    log('info', `Host connects to control port ${c(C.cyan, String(controlPort))}`);
+  });
+
+  playerServer.once('error', (err) => {
+    if (err.code === 'EADDRINUSE') die(`Port ${playerPort} is already in use`);
+    die(`Player server error: ${err.message}`);
+  });
+
+  // Start control server
+  controlServer.listen(controlPort, '0.0.0.0', () => {
+    log('ok', `Control server ready on port ${c(C.bold, String(controlPort))}`);
+  });
+
+  controlServer.once('error', (err) => {
+    if (err.code === 'EADDRINUSE') die(`Control port ${controlPort} is already in use`);
+    die(`Control server error: ${err.message}`);
+  });
+
+  // Stats display
+  setInterval(() => {
+    if (activeConns.size > 0 || pendingConns.size > 0) {
+      log('stat', `active: ${c(C.cyan, String(activeConns.size))}  pending: ${c(C.yellow, String(pendingConns.size))}  up: ${fmtBytes(tunnelBytes.up)}  down: ${fmtBytes(tunnelBytes.down)}`);
+    }
+  }, 15000);
+
+  return new Promise((resolve) => {
+    shutdownTimer = setTimeout(() => {}, 1 << 30); // dummy
+    process.on('SIGINT', () => resolve());
+    process.on('SIGTERM', () => resolve());
+  });
 }
 
 // ───────────────────────────────────────────────────────────────
-//  SERVE command — Slave mode
-//  Listens for Minecraft clients, relays to Host
+//  HOST — Admin mode
+//  Connects to Slave's control port, interactive approval CLI
 // ───────────────────────────────────────────────────────────────
 
-function runServe(listenAddr, hostAddr, opts) {
-  const stats = new Stats('mcnux serve');
-  const verbose = opts.verbose;
+function runHost(slaveAddr, opts) {
+  const mcTarget = parseAddr(opts.mcTarget || 'localhost:25565');
 
-  log('info', `${c(C.bold, 'mcnux serve')} ${c(C.dim, `v${VERSION}`)}`);
-  log('info', `  listen for clients → ${c(C.cyan, fmtAddr(listenAddr))}`);
-  log('info', `  relay through Host → ${c(C.cyan, fmtAddr(hostAddr))}`);
+  log('info', `${c(C.bold, 'mcnux host')} ${c(C.dim, `v${VERSION}`)}`);
+  log('info', `  Slave control     → ${c(C.cyan, fmtAddr(slaveAddr))}`);
+  log('info', `  MC server target  → ${c(C.cyan, fmtAddr(mcTarget))}`);
 
-  const server = net.createServer((clientSock) => {
-    const id = stats.open();
-    const clientAddr = `${clientSock.remoteAddress}:${clientSock.remotePort}`;
-    log('conn', `[${id}] client connected ${c(C.cyan, clientAddr)}`, c(C.dim, 'connecting to Host...'));
+  // ── Data Listener (Slave connects here for tunnels) ──────
+  const dataServer = net.createServer((tunnelSock) => {
+    let hdrBuf = Buffer.alloc(0);
+    let connId = null;
+    let headerDone = false;
+    const pendingData = [];
+    let mcSock = null;
+    let tunnelBridge = null;
 
-    // Parse Minecraft handshake from first data
-    let handshakeLogged = false;
+    function onTunnelData(chunk) {
+      if (!headerDone) {
+        hdrBuf = Buffer.concat([hdrBuf, chunk]);
+        const nlIdx = hdrBuf.indexOf(10); // \n
+        if (nlIdx === -1) return; // need more data
 
-    // Connect to Host
-    const hostSock = new net.Socket();
-    hostSock.once('error', (e) => {
-      if (hostSock.destroyed) return;
-      log('error', `[${id}] Host ${fmtAddr(hostAddr)}: ${e.message}`);
-      clientSock.end(); stats.close();
-    });
+        connId = hdrBuf.slice(0, nlIdx).toString('utf8');
+        const remaining = hdrBuf.slice(nlIdx + 1);
+        hdrBuf = null;
+        headerDone = true;
 
-    hostSock.connect(hostAddr.port, hostAddr.host, () => {
-      if (clientSock.destroyed) return;
-      log('ok', `[${id}] connected to Host ${c(C.green, fmtAddr(hostAddr))}`);
+        log('info', `[${connId}] tunnel connected from Slave`);
 
-      const bridge = bridgeSockets(id, clientSock, hostSock,
-        `client ${clientAddr}`, `Host ${fmtAddr(hostAddr)}`, verbose);
+        // Buffer data that arrived with the header
+        if (remaining.length > 0) pendingData.push(remaining);
 
-      clientSock.on('data', (data) => {
-        // Parse handshake on first client data
-        if (!handshakeLogged) {
-          const hs = parseHandshake(data);
-          if (hs) {
-            handshakeLogged = true;
-            const stateColor = hs.nextState === 2 ? C.green : C.yellow;
-            log('info', `[${id}] handshake: proto=${c(C.cyan, hs.protocolVersion)} server=${c(C.bold, hs.serverAddress)}:${hs.serverPort} next=${c(stateColor, hs.nextStateName)}`);
+        // Connect to MC server
+        mcSock = new net.Socket();
+        mcSock.once('error', (e) => {
+          log('error', `[${connId}] MC server ${fmtAddr(mcTarget)}: ${e.message}`);
+          if (tunnelBridge) tunnelBridge.cleanup();
+          else { tunnelSock.end(); tunnelSock.destroy(); }
+        });
+
+        mcSock.connect(mcTarget.port, mcTarget.host, () => {
+          log('ok', `[${connId}] tunnel → MC ${c(C.green, fmtAddr(mcTarget))}`);
+
+          // Flush pending data that arrived before MC connection
+          for (const d of pendingData) {
+            if (mcSock.writable) mcSock.write(d);
           }
+          pendingData.length = 0;
+
+          // Remove header parser before bridge takes over
+          tunnelSock.removeListener('data', onTunnelData);
+
+          // Bridge
+          tunnelBridge = bridgeSockets(tunnelSock, mcSock);
+
+          tunnelSock.once('close', () => {
+            if (tunnelBridge && !tunnelBridge.isClosed()) {
+              log('disc', `[${connId}] tunnel closed`);
+              tunnelBridge.cleanup();
+            }
+          });
+
+          mcSock.once('close', () => {
+            if (tunnelBridge && !tunnelBridge.isClosed()) {
+              log('disc', `[${connId}] MC server disconnected`);
+              tunnelBridge.cleanup();
+            }
+          });
+        });
+        return;
+      }
+
+      // Header done but MC not yet connected — buffer
+      pendingData.push(chunk);
+    }
+
+    tunnelSock.on('data', onTunnelData);
+    tunnelSock.once('error', (e) => {
+      if (!headerDone) log('error', `tunnel error before header: ${e.message}`);
+    });
+  });
+
+  dataServer.once('error', (err) => {
+    die(`Data listener error: ${err.message}`);
+  });
+
+  // ── Connect to Slave Control ──────────────────────────────
+  const controlSock = new net.Socket();
+  let controlBuf = '';
+  let connected = false;
+
+  function sendCtrl(msg) {
+    if (!controlSock.destroyed) {
+      try { controlSock.write(msg + '\n'); } catch (_) {}
+    }
+  }
+
+  controlSock.on('data', (chunk) => {
+    controlBuf += chunk.toString();
+    while (controlBuf.includes('\n')) {
+      const nlIdx = controlBuf.indexOf('\n');
+      const line = controlBuf.slice(0, nlIdx).trim();
+      controlBuf = controlBuf.slice(nlIdx + 1);
+      if (!line) continue;
+      handleCtrlMsg(line);
+    }
+  });
+
+  let pendingConnections = [];  // { id, addr, handshake (optional) }
+  let activeTunnels = new Map();
+
+  function handleCtrlMsg(line) {
+    const parts = line.split(' ');
+    const cmd = parts[0];
+
+    switch (cmd) {
+      case 'OK': {
+        log('ok', `Slave: ${parts.slice(1).join(' ')}`);
+        break;
+      }
+
+      case 'ERROR': {
+        log('error', `Slave: ${parts.slice(1).join(' ')}`);
+        break;
+      }
+
+      case 'CONN_REQ': {
+        // CONN_REQ <id> <playerAddr>
+        const id = parts[1];
+        const addr = parts.slice(2).join(' ');
+        const entry = { id, addr, handshake: null };
+        pendingConnections.push(entry);
+        log('conn', `[${c(C.cyan, id)}] New connection from ${c(C.bold, addr)} ${c(C.dim, '— type "approve ' + id + '" to allow')}`);
+        renderPrompt();
+        break;
+      }
+
+      case 'HANDSHAKE': {
+        // HANDSHAKE <id> <serverHost> <serverPort>
+        const id = parts[1];
+        const srvHost = parts[2];
+        const srvPort = parseInt(parts[3], 10);
+        const entry = pendingConnections.find(p => p.id === id);
+        if (entry) {
+          entry.handshake = `${srvHost}:${srvPort}`;
+        }
+        break;
+      }
+
+      case 'CONNS': {
+        // CONNS <id>:<addr>[:<hs>] ...
+        pendingConnections = [];
+        for (let i = 1; i < parts.length; i++) {
+          const segs = parts[i].split(':');
+          if (segs.length >= 2) {
+            pendingConnections.push({
+              id: segs[0],
+              addr: segs[1] + (segs[2] ? `:${segs[2]}` : ''),
+              handshake: segs.slice(3).join(':') || null,
+            });
+          }
+        }
+        renderPrompt();
+        break;
+      }
+
+      case 'CONN_LOST': {
+        // CONN_LOST <id> [reason]
+        const id = parts[1];
+        const reason = parts.slice(2).join(' ') || 'disconnected';
+        pendingConnections = pendingConnections.filter(p => p.id !== id);
+        log('disc', `[${c(C.dim, id)}] ${reason}`);
+        renderPrompt();
+        break;
+      }
+
+      case 'ACTIVE': {
+        // ACTIVE <id>:<addr> ...
+        activeTunnels = new Map();
+        for (let i = 1; i < parts.length; i++) {
+          const segs = parts[i].split(':');
+          if (segs.length >= 2) {
+            activeTunnels.set(segs[0], segs.slice(1).join(':'));
+          }
+        }
+        break;
+      }
+
+      case 'TUNNEL_CLOSE': {
+        const id = parts[1];
+        activeTunnels.delete(id);
+        log('disc', `[${c(C.dim, id)}] tunnel closed`);
+        renderPrompt();
+        break;
+      }
+
+      default:
+        log('info', `Slave: ${line}`);
+    }
+  }
+
+  controlSock.once('close', () => {
+    log('error', c(C.red, 'Lost connection to Slave'));
+    if (connected) {
+      process.exit(1);
+    }
+  });
+
+  controlSock.once('error', (e) => {
+    die(`Failed to connect to Slave at ${fmtAddr(slaveAddr)}: ${e.message}`);
+  });
+
+  // ── Interactive CLI ─────────────────────────────────────
+  let rl = null;
+  let promptDirty = false;
+
+  function renderPrompt() {
+    if (promptDirty) {
+      // Just mark it, redraw on next user input or new connection notification
+    }
+  }
+
+  function printPending() {
+    if (pendingConnections.length === 0) {
+      console.log('  No pending connections.');
+      return;
+    }
+    console.log(`  ${c(C.bold, 'Pending Connections:')}`);
+    for (const p of pendingConnections) {
+      const hs = p.handshake ? c(C.dim, ` → ${p.handshake}`) : '';
+      console.log(`    ${c(C.cyan, p.id)}  ${c(C.bold, p.addr)}${hs}`);
+    }
+  }
+
+  function printActive() {
+    if (activeTunnels.size === 0) {
+      console.log('  No active tunnels.');
+      return;
+    }
+    console.log(`  ${c(C.bold, 'Active Tunnels:')}`);
+    for (const [id, addr] of activeTunnels) {
+      console.log(`    ${c(C.green, id)}  ${addr}`);
+    }
+  }
+
+  function showHelp() {
+    console.log(`
+  ${c(C.bold, 'Commands:')}
+    ${c(C.cyan, 'connections')}     List pending player connections
+    ${c(C.cyan, 'approve <id>')}   Approve a pending connection
+    ${c(C.cyan, 'deny <id>')}      Deny a pending connection
+    ${c(C.cyan, 'active')}         List active tunnels
+    ${c(C.cyan, 'refresh')}        Refresh pending list from Slave
+    ${c(C.cyan, 'help')}           Show this help
+    ${c(C.cyan, 'exit')}           Disconnect and quit
+`);
+  }
+
+  function shutdown() {
+    log('info', c(C.yellow, 'disconnecting...'));
+    if (rl) rl.close();
+    if (!controlSock.destroyed) { controlSock.end(); controlSock.destroy(); }
+    dataServer.close(() => {});
+    log('ok', 'goodbye');
+    process.exit(0);
+  }
+
+  // ── Connect to Slave ──────────────────────────────────────
+  controlSock.connect(slaveAddr.port, slaveAddr.host, () => {
+    connected = true;
+    const localAddr = controlSock.localAddress;
+    const localFamily = controlSock.localFamily;
+
+    // Start data listener on random port
+    dataServer.listen(0, '0.0.0.0', () => {
+      const dataPort = dataServer.address().port;
+      // Send HELLO with our data listener address and MC target
+      const helloMsg = `HELLO ${localAddr} ${dataPort} ${fmtAddr(mcTarget)}`;
+      sendCtrl(helloMsg);
+
+      log('ok', `Connected to Slave at ${c(C.bold, fmtAddr(slaveAddr))}`);
+      log('ok', `Data listener on ${c(C.cyan, `${localAddr}:${dataPort}`)}`);
+      log('info', `MC server target: ${c(C.cyan, fmtAddr(mcTarget))}`);
+      console.log('');
+      console.log(`  ${c(C.bold, 'Waiting for connections...')}  Type ${c(C.cyan, 'help')} for commands`);
+      console.log('');
+
+      // Start readline interface
+      rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        prompt: color ? `${C.cyan}mcnux host> ${C.reset}` : 'mcnux host> ',
+        terminal: true,
+      });
+
+      rl.on('line', (input) => {
+        const trimmed = input.trim();
+        if (!trimmed) {
+          rl.prompt();
+          return;
+        }
+
+        const args = trimmed.split(/\s+/);
+        const cmd = args[0].toLowerCase();
+
+        switch (cmd) {
+          case 'connections':
+          case 'conns':
+          case 'conn': {
+            printPending();
+            rl.prompt();
+            break;
+          }
+
+          case 'approve': {
+            const id = args[1];
+            if (!id) {
+              console.log('  Usage: approve <id>');
+              rl.prompt();
+              break;
+            }
+            const entry = pendingConnections.find(p => p.id === id);
+            if (!entry) {
+              console.log(`  ${c(C.red, '✗')} Connection ${id} not found`);
+              rl.prompt();
+              break;
+            }
+            sendCtrl(`APPROVE ${id}`);
+            pendingConnections = pendingConnections.filter(p => p.id !== id);
+            console.log(`  ${c(C.green, '✓')} Approved connection ${c(C.cyan, id)}`);
+            if (entry.handshake) {
+              console.log(`    Player connecting to ${c(C.dim, entry.handshake)}`);
+            }
+            rl.prompt();
+            break;
+          }
+
+          case 'deny': {
+            const id = args[1];
+            if (!id) {
+              console.log('  Usage: deny <id>');
+              rl.prompt();
+              break;
+            }
+            const entry = pendingConnections.find(p => p.id === id);
+            if (!entry) {
+              console.log(`  ${c(C.red, '✗')} Connection ${id} not found`);
+              rl.prompt();
+              break;
+            }
+            sendCtrl(`DENY ${id}`);
+            pendingConnections = pendingConnections.filter(p => p.id !== id);
+            console.log(`  ${c(C.yellow, '−')} Denied connection ${c(C.cyan, id)}`);
+            rl.prompt();
+            break;
+          }
+
+          case 'active':
+          case 'act': {
+            printActive();
+            if (pendingConnections.length > 0) {
+              console.log('');
+              printPending();
+            }
+            rl.prompt();
+            break;
+          }
+
+          case 'refresh':
+          case 'ref': {
+            sendCtrl('LIST_CONNS');
+            sendCtrl('LIST_ACTIVE');
+            console.log('  Refreshing...');
+            rl.prompt();
+            break;
+          }
+
+          case 'help':
+          case 'h': {
+            showHelp();
+            rl.prompt();
+            break;
+          }
+
+          case 'quit':
+          case 'exit':
+          case 'q': {
+            shutdown();
+            break;
+          }
+
+          default:
+            console.log(`  Unknown command: ${cmd}  (type ${c(C.cyan, 'help')} for commands)`);
+            rl.prompt();
         }
       });
 
-      clientSock.once('close', () => {
-        if (bridge.isClosed()) return;
-        log('disc', `[${id}] client disconnected ${c(C.dim, clientAddr)}`);
-        stats.close();
-        stats.up(bridge.getBytesUp());
-        stats.down(bridge.getBytesDown());
-        log('info', `[${id}] session closed — ↑${fmtBytes(bridge.getBytesUp())} ↓${fmtBytes(bridge.getBytesDown())}`);
-        bridge.cleanup();
+      rl.on('close', () => {
+        shutdown();
       });
 
-      hostSock.once('close', () => {
-        if (bridge.isClosed()) return;
-        log('disc', `[${id}] Host disconnected`);
-        stats.close();
-        stats.up(bridge.getBytesUp());
-        stats.down(bridge.getBytesDown());
-        log('info', `[${id}] session closed — ↑${fmtBytes(bridge.getBytesUp())} ↓${fmtBytes(bridge.getBytesDown())}`);
-        bridge.cleanup();
-      });
+      // Override prompt for connection notifications
+      const origLog = console.log;
+      console.log = function(...args) {
+        origLog.apply(console, args);
+        if (rl) {
+          rl.prompt(true);
+        }
+      };
+
+      rl.prompt();
     });
   });
 
-  return startServer(server, listenAddr, stats, 'serve');
-}
-
-// ───────────────────────────────────────────────────────────────
-//  Server runner (shared between connect/serve)
-// ───────────────────────────────────────────────────────────────
-
-function startServer(server, listenAddr, stats, cmd) {
   return new Promise((resolve) => {
-    server.once('error', (err) => {
-      if (err.code === 'EADDRINUSE') die(`Port ${listenAddr.port} is already in use`);
-      if (err.code === 'EACCES') die(`Permission denied — port ${listenAddr.port} needs elevated privileges`);
-      die(`Server error: ${err.message}`);
-    });
-
-    server.listen(listenAddr.port, listenAddr.host, () => {
-      log('ok', `listening on ${c(C.bold, fmtAddr(listenAddr))}`);
-      if (cmd === 'serve') {
-        log('ok', `players join this IP on port ${c(C.cyan, String(listenAddr.port))}`);
-      }
-
-      const statsInterval = setInterval(() => stats.display(), 10000);
-
-      const shutdown = () => {
-        clearInterval(statsInterval);
-        log('info', c(C.yellow, 'shutting down...'));
-        server.close(() => {
-          if (stats.active > 0) log('info', `draining ${stats.active} active connection(s)...`);
-          stats.display();
-          log('ok', 'goodbye');
-          resolve();
-        });
-        setTimeout(() => { log('warn', 'force exit'); process.exit(0); }, 5000);
-      };
-
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
-    });
+    // Keep alive until exit
   });
 }
 
@@ -442,85 +989,80 @@ function help() {
 ${b}mcnux${r}  —  Minecraft Proxy CLI  ${d}v${VERSION}${r}
 
 Architecture:
-  Client <-> Slave :25565 <-> Host :25566 <-> MC Server
+  Player → Slave :25565 (pending) → Host approves → tunnel → MC Server
 
 ${b}COMMANDS${r}
 
-  ${b}connect${r} <listen-addr> <target-addr>    Host mode
-    Listen for Slave connections, forward to the real Minecraft server.
-    Run this on the machine that can reach the MC server.
+  ${b}host${r} <slave-host> <control-port>    Admin mode
+    Connect to a Slave, view pending connections, approve or deny them.
+    Players are queued until you approve.
 
     ${d}Examples:${r}
-      mcnux connect 0.0.0.0:25566 localhost:25565
-      mcnux connect 0.0.0.0:25566 play.hypixel.net
+      mcnux host 192.168.1.100 25567
+      mcnux host slave.example.com 25567 --mc-server localhost:25565
 
-  ${b}serve${r} <listen-addr> <host-addr>        Slave mode
-    Accept Minecraft clients, relay all traffic through the Host.
-    Run this on a public-facing machine.
+  ${b}serve${r} [player-port=25565] [control-port=25567]   Slave mode
+    Accept Minecraft players and Host connections. Players are queued
+    until the Host approves them.
 
     ${d}Examples:${r}
-      mcnux serve 0.0.0.0:25565 10.0.0.1:25566
-      mcnux serve 0.0.0.0:25565 host.example.com:25566
+      mcnux serve
+      mcnux serve 25565 25567
 
 ${b}OPTIONS${r}
-  -v, --verbose              Show hex-dump of packet traffic
+  --mc-server <addr>         Target Minecraft server address (default: localhost:25565)
   --no-color                 Disable ANSI colors
   -h, --help                 Show help
   --version                  Print version
 
-${b}HOW IT WORKS${r}
-  Players connect to the ${b}Slave's${r} IP/port. The Slave tunnels everything
-  through the ${b}Host${r} to the real Minecraft server.
+${b}WORKFLOW${r}
+  1. Start the ${b}Slave${r} on your public machine:
+       $ mcnux serve
 
-  Start the Host first, then the Slave:
-    ${d}# Machine A (near MC server):${r}
-    $ mcnux connect 0.0.0.0:25566 localhost:25565
+  2. Start the ${b}Host${r} on the MC server machine:
+       $ mcnux host <slave-public-ip> 25567
 
-    ${d}# Machine B (public-facing):${r}
-    $ mcnux serve 0.0.0.0:25565 10.0.0.1:25566
+  3. When players connect, approve them from the Host prompt:
+       mcnux host> connections
+       mcnux host> approve 1
 `);
 }
 
 function showCmdHelp(cmd) {
-  const b = color ? C.bold : '';
-  const d = color ? C.dim : '';
-  const r = color ? C.reset : '';
-
-  if (cmd === 'connect') {
+  if (cmd === 'host') {
     console.log(`
-${b}mcnux connect${r}  —  Host mode
+${color ? C.bold : ''}mcnux host${color ? C.reset : ''}  —  Admin mode
 
-Listen for Slave connections, forward to the real Minecraft server.
-Run this on the machine that can reach the MC server.
+Connect to a Slave's control port and approve/deny incoming players.
 
-${b}Usage:${r}
-  mcnux connect <listen-addr> <target-addr>
+${color ? C.bold : ''}Usage:${color ? C.reset : ''}
+  mcnux host <slave-host> <control-port> [options]
 
-  <listen-addr>    Address to listen for Slave connections   ${d}(default port: 25566)${r}
-  <target-addr>    Minecraft server to forward to            ${d}(default: localhost:25565)${r}
+  <slave-host>       Hostname or IP of the Slave machine
+  <control-port>     Control port on the Slave (default: 25567)
 
-${b}Examples:${r}
-  mcnux connect 0.0.0.0:25566 localhost:25565
-  mcnux connect 0.0.0.0:25566 play.hypixel.net
-  mcnux connect 0.0.0.0:25566 192.168.1.10:25565
+${color ? C.bold : ''}Options:${color ? C.reset : ''}
+  --mc-server <addr>   Target Minecraft server (default: localhost:25565)
+
+${color ? C.bold : ''}Examples:${color ? C.reset : ''}
+  mcnux host 192.168.1.100 25567
+  mcnux host slave.example.com 25567 --mc-server play.hypixel.net
 `);
   } else if (cmd === 'serve') {
     console.log(`
-${b}mcnux serve${r}  —  Slave mode
+${color ? C.bold : ''}mcnux serve${color ? C.reset : ''}  —  Slave mode
 
-Accept Minecraft clients, relay all traffic through the Host.
-Run this on a public-facing machine that players can connect to.
+Accept Minecraft players (pending queue) and Host control connections.
 
-${b}Usage:${r}
-  mcnux serve <listen-addr> <host-addr>
+${color ? C.bold : ''}Usage:${color ? C.reset : ''}
+  mcnux serve [player-port] [control-port]
 
-  <listen-addr>    Address to listen for Minecraft clients   ${d}(default port: 25565)${r}
-  <host-addr>      Host address to relay through             ${d}(default: localhost:25566)${r}
+  [player-port]    Port for Minecraft players to connect on  (default: 25565)
+  [control-port]   Port for Host to connect on              (default: 25567)
 
-${b}Examples:${r}
-  mcnux serve 0.0.0.0:25565 host.example.com:25566
-  mcnux serve 0.0.0.0:25565 10.0.0.1:25566
-  mcnux serve :25565 192.168.1.5:25566
+${color ? C.bold : ''}Examples:${color ? C.reset : ''}
+  mcnux serve
+  mcnux serve 25565 25567
 `);
   } else {
     help();
@@ -539,10 +1081,6 @@ function main() {
     if (flag === '--no-color') { color = false; argIdx++; }
     else if (flag === '-h' || flag === '--help') { help(); return; }
     else if (flag === '--version') { printVersion(); return; }
-    else if (flag === '-v' || flag === '--verbose') {
-      // Will be passed to subcommand
-      break;
-    }
     else break;
   }
 
@@ -559,42 +1097,40 @@ function main() {
     return;
   }
 
-  // Parse shared opts from remaining flags
-  const opts = { verbose: false };
+  // Parse opts + positional
+  const opts = { verbose: false, mcTarget: null };
   const positional = [];
   for (let i = 0; i < cmdArgs.length; i++) {
     const a = cmdArgs[i];
-    if (a === '-v' || a === '--verbose') opts.verbose = true;
-    else if (a === '--no-color') color = false;
+    if (a === '--no-color') color = false;
     else if (a === '-h' || a === '--help') { showCmdHelp(cmd); return; }
+    else if (a === '--mc-server') opts.mcTarget = cmdArgs[++i];
     else if (a.startsWith('-')) die(`Unknown option: ${a}`);
     else positional.push(a);
   }
 
   switch (cmd) {
-    case 'connect': {
-      if (positional.length < 1) die('Usage: mcnux connect <listen-addr> <target-addr>\n  Example: mcnux connect 0.0.0.0:25566 localhost:25565');
-      const listenAddr = parseAddr(positional[0]);
-      if (!listenAddr || isNaN(listenAddr.port) || listenAddr.port < 1) die(`Invalid listen address: ${positional[0]}`);
-      const targetAddr = parseAddr(positional[1] || 'localhost:25565');
-      if (!targetAddr || isNaN(targetAddr.port) || targetAddr.port < 1) die(`Invalid target address: ${positional[1] || 'localhost:25565'}`);
-      runConnect(listenAddr, targetAddr, opts);
+    case 'host': {
+      if (positional.length < 2) die('Usage: mcnux host <slave-host> <control-port>\n  Example: mcnux host 192.168.1.100 25567');
+      const slaveHost = positional[0];
+      const controlPort = parseInt(positional[1], 10);
+      if (isNaN(controlPort)) die(`Invalid control port: ${positional[1]}`);
+      runHost({ host: slaveHost, port: controlPort }, opts);
       break;
     }
 
     case 'serve': {
-      if (positional.length < 1) die('Usage: mcnux serve <listen-addr> <host-addr>\n  Example: mcnux serve 0.0.0.0:25565 host.example.com:25566');
-      const listenAddr = parseAddr(positional[0]);
-      if (!listenAddr || isNaN(listenAddr.port) || listenAddr.port < 1) die(`Invalid listen address: ${positional[0]}`);
-      const hostAddr = parseAddr(positional[1] || 'localhost:25566');
-      if (!hostAddr || isNaN(hostAddr.port) || hostAddr.port < 1) die(`Invalid host address: ${positional[1] || 'localhost:25566'}`);
-      runServe(listenAddr, hostAddr, opts);
+      const playerPort = parseInt(positional[0], 10) || 25565;
+      const controlPort = parseInt(positional[1], 10) || 25567;
+      if (isNaN(playerPort) || playerPort < 1) die(`Invalid player port: ${positional[0] || '25565'}`);
+      if (isNaN(controlPort) || controlPort < 1) die(`Invalid control port: ${positional[1] || '25567'}`);
+      runServe(playerPort, controlPort, opts);
       break;
     }
 
     default:
-      die(`Unknown command: ${cmd}\n  Usage: mcnux connect ...  or  mcnux serve ...`);
+      die(`Unknown command: ${cmd}\n  Commands: host, serve`);
   }
 }
 
-main();
+if (require.main === module) main();
