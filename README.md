@@ -1,28 +1,37 @@
 # mcnux — Minecraft Proxy CLI
 
-Two-agent Minecraft proxy. **Connect** (Host) handles the upstream to the real server. **Serve** (Slave) accepts players and relays through the Host.
+Two-agent Minecraft proxy with zero npm dependencies.
 
-```ascii
+```
 Client  <->  mcnux serve :25565  <->  mcnux connect :25566  <->  MC Server
 ```
 
-Players join the **Slave's IP** and play on the **Host's** server.
+Players join the **Slave** (public-facing), the **Host** (near the MC server) bridges to the real server.
 
-## Quick start
+## Install
 
 ```bash
-# On the machine near the MC server (Host)
-mcnux connect 0.0.0.0:25566 localhost:25565
-
-# On the public-facing machine (Slave)
-mcnux serve 0.0.0.0:25565 10.0.0.1:25566
+npm install -g mcnux
 ```
 
-## Commands
+Then `mcnux --help` anywhere. That's it — no other setup.
 
-### `mcnux connect <listen-addr> <target-addr>`
+## Architecture
 
-**Host mode** — listens for Slave connections, forwards to the real MC server.
+Two processes connect to create one tunnel:
+
+- **Host** (`mcnux connect`) — runs on the machine near the Minecraft server. Listens for the Slave, relays traffic to the MC server.
+- **Slave** (`mcnux serve`) — runs on a public-facing machine. Players connect here, traffic gets relayed through the Host.
+
+The tunnel is plain TCP — no npm deps, Node built-ins only.
+
+## Usage
+
+### Host mode
+
+```bash
+mcnux connect <listen-addr> <target-addr>
+```
 
 | Argument | Description | Default |
 |---|---|---|
@@ -30,14 +39,21 @@ mcnux serve 0.0.0.0:25565 10.0.0.1:25566
 | `<target-addr>` | Minecraft server to forward to | `localhost:25565` |
 
 ```bash
+# Basic — listen on :25566, forward to local MC server
 mcnux connect 0.0.0.0:25566 localhost:25565
+
+# Forward to a remote MC server
 mcnux connect 0.0.0.0:25566 play.hypixel.net
+
+# Verbose mode — see all packet traffic
 mcnux connect 0.0.0.0:25566 192.168.1.10:25565 -v
 ```
 
-### `mcnux serve <listen-addr> <host-addr>`
+### Slave mode
 
-**Slave mode** — accepts Minecraft clients, relays through the Host.
+```bash
+mcnux serve <listen-addr> <host-addr>
+```
 
 | Argument | Description | Default |
 |---|---|---|
@@ -45,8 +61,11 @@ mcnux connect 0.0.0.0:25566 192.168.1.10:25565 -v
 | `<host-addr>` | Host address to relay through | `localhost:25566` |
 
 ```bash
-mcnux serve 0.0.0.0:25565 host.example.com:25566
-mcnux serve 0.0.0.0:25565 10.0.0.1:25566 -v
+# Basic — accept players on :25565, relay through Host at 10.0.0.1:25566
+mcnux serve 0.0.0.0:25565 10.0.0.1:25566
+
+# With verbose packet dump
+mcnux serve 0.0.0.0:25565 host.example.com:25566 -v
 ```
 
 ### Options
@@ -65,18 +84,6 @@ mcnux serve 0.0.0.0:25565 10.0.0.1:25566 -v
 - **Hex dump** — `-v` shows packet-level traffic in `hexdump -C` format
 - **Live stats** — byte counters, transfer rates, connection counts, uptime (updates every 10s)
 - **Clean shutdown** — drains active connections on SIGINT/SIGTERM
-
-## Install
-
-```bash
-npm install -g mcnux
-# or from source:
-git clone https://github.com/EliasL-git/mc-proxy
-cd mc-proxy
-npm link
-```
-
-Then `mcnux --help` anywhere.
 
 ## License
 
