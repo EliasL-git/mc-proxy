@@ -6,7 +6,7 @@ Two-agent Minecraft proxy with zero npm dependencies.
 Client  <->  mcnux serve :25565  <->  mcnux connect :25566  <->  MC Server
 ```
 
-Players join the **Slave** (public-facing), the **Host** (near the MC server) bridges to the real server.
+Players join the **Slave** (public-facing), traffic gets relayed through the **Host** to the real server.
 
 ## Install
 
@@ -20,8 +20,8 @@ Then `mcnux --help` anywhere. That's it — no other setup.
 
 Two processes connect to create one tunnel:
 
-- **Host** (`mcnux connect`) — runs on the machine near the Minecraft server. Listens for the Slave, relays traffic to the MC server.
-- **Slave** (`mcnux serve`) — runs on a public-facing machine. Players connect here, traffic gets relayed through the Host.
+- **Host** (`mcnux connect`) — runs on the machine that runs the Minecraft server, or on a machine on the same local network. Low latency to the MC server is critical.
+- **Slave** (`mcnux serve`) — runs on a public-facing machine. Players connect here, traffic gets relayed through the Host to the MC server.
 
 The tunnel is plain TCP — no npm deps, Node built-ins only.
 
@@ -29,21 +29,23 @@ The tunnel is plain TCP — no npm deps, Node built-ins only.
 
 ### Host mode
 
-```bash
+Runs on the Minecraft server machine (or same LAN). Listens for Slave connections, forwards to the real MC server.
+
+```
 mcnux connect <listen-addr> <target-addr>
 ```
 
 | Argument | Description | Default |
 |---|---|---|
 | `<listen-addr>` | Address to listen for Slave connections | `0.0.0.0:25566` |
-| `<target-addr>` | Minecraft server to forward to | `localhost:25565` |
+| `<target-addr>` | Minecraft server address (use `localhost` if on the same machine) | `localhost:25565` |
 
 ```bash
-# Basic — listen on :25566, forward to local MC server
+# MC server on the same machine — forward via localhost
 mcnux connect 0.0.0.0:25566 localhost:25565
 
-# Forward to a remote MC server
-mcnux connect 0.0.0.0:25566 play.hypixel.net
+# MC server on a different machine on the same LAN
+mcnux connect 0.0.0.0:25566 192.168.1.10:25565
 
 # Verbose mode — see all packet traffic
 mcnux connect 0.0.0.0:25566 192.168.1.10:25565 -v
@@ -51,7 +53,9 @@ mcnux connect 0.0.0.0:25566 192.168.1.10:25565 -v
 
 ### Slave mode
 
-```bash
+Runs on a public-facing machine. Accepts Minecraft clients, relays through the Host.
+
+```
 mcnux serve <listen-addr> <host-addr>
 ```
 
