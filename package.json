@@ -3,9 +3,7 @@
   "version": "1.0.0",
   "description": "Two-agent Minecraft proxy: connect (Host) + serve (Slave). Zero npm deps.",
   "bin": {
-    "mcnux": "./mcnux.js",
-    "mc-proxy-host": "./mc-proxy-host.js",
-    "mc-proxy-slave": "./mc-proxy-slave.js"
+    "mcnux": "./mcnux.js"
   },
   "repository": {
     "type": "git",
@@ -16,8 +14,6 @@
     "node": ">=18.0.0"
   },
   "files": [
-    "mcnux.js",
-    "mc-proxy-host.js",
-    "mc-proxy-slave.js"
+    "mcnux.js"
   ]
 }

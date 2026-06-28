@@ -78,15 +78,6 @@ npm link
 
 Then `mcnux --help` anywhere.
 
-## Legacy CLIs
-
-The repo also ships individual scripts if you prefer:
-
-```bash
-node mc-proxy-host.js --help   # standalone Host
-node mc-proxy-slave.js --help  # standalone Slave
-```
-
 ## License
 
 MIT
